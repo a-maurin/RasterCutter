@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest / Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Packaging & Archives
+*.zip
+*.tar.gz
+dist/
+build/
+*.egg-info/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# QGIS user files
+*.qgs~
+*.qgz~
+*.log

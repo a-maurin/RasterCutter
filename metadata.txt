@@ -1,0 +1,18 @@
+[general]
+name=RasterCutter
+qgisMinimumVersion=3.0
+description=Découpe de raster par pochoir
+version=1.0.0
+author=Aguirre MAURIN
+email=aguirre.maurin@murena.io
+about=Découpe de rasters (locaux ou distants) selon l'emprise d'une couche vectorielle avec filtrage et carroyage.
+tracker=https://github.com/AguirreM/RasterCutter/issues
+repository=https://github.com/AguirreM/RasterCutter
+hasProcessingProvider=no
+tags=raster,clip,mask,pochoir,wms,wmts,mbtiles,gdal,stencil
+homepage=https://github.com/AguirreM/RasterCutter
+category=Raster
+icon=icon.png
+experimental=False
+deprecated=False
+license=GNU GPL v3 (GPL-3.0-or-later)

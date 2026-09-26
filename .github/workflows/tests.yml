@@ -1,0 +1,30 @@
+name: Tests unitaires QGIS
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer QGIS et dépendances PyQGIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qgis \
+            python3-qgis \
+            python3-pytest \
+            python3-gdal \
+            gdal-bin \
+            xvfb
+
+      - name: Exécuter les tests sous environnement virtuel d'affichage (xvfb)
+        run: |
+          xvfb-run -a pytest tests/unit -v
