@@ -5,7 +5,7 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Tests](https://img.shields.io/badge/Tests-45%20passed-brightgreen.svg)]()
 
-RasterCutter est une extension pour QGIS conçue pour découper avec précision des couches rasters à partir d'un masque vectoriel (« pochoir »). L'outil prend en charge aussi bien les rasters locaux que les flux distants tuilés, gère le découpage en série multi-couches, et propose des options avancées de carroyage régulier pour l'intégration des fonds de plan dans les logiciels de dessin assisté par ordinateur (CAO) et les systèmes d'information géographique (SIG).
+RasterCutter est une extension pour QGIS conçue pour découper des couches rasters à partir d'un masque vectoriel (« pochoir »). L'outil prend en charge aussi bien les rasters locaux que les flux distants tuilés, gère le découpage en série multi-couches, et propose des options de carroyage régulier pour l'intégration des fonds de plan dans les logiciels de dessin assisté par ordinateur (CAO) et les systèmes d'information géographique (SIG).
 
 ---
 
@@ -90,6 +90,6 @@ pytest
 
 ## Auteur et licence
 
-L'extension RasterCutter est développée par Aguirre Maurin (EPAGE SMBVA).
+L'extension RasterCutter est développée par Aguirre Maurin.
 
 Ce projet est distribué sous licence libre GNU General Public License v3.0 (GPL-3.0-or-later). Consulter le fichier LICENSE pour le texte complet des conditions d'utilisation et de redistribution.
