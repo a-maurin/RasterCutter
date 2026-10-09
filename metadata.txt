@@ -1,11 +1,11 @@
 [general]
 name=RasterCutter
 qgisMinimumVersion=3.0
-description=Découpe de raster par pochoir
+description=Découpe de rasters par masque vectoriel, carroyage spatial et traitement multi-couches
 version=1.0.0
 author=Aguirre MAURIN
 email=aguirre.maurin@murena.io
-about=Découpe de rasters (locaux ou distants) selon l'emprise d'une couche vectorielle avec filtrage et carroyage.
+about=Découpe de rasters locaux ou distants selon l'emprise d'un masque vectoriel, avec carroyage pour la CAO, export multi-couches et moteur asynchrone.
 tracker=https://github.com/a-maurin/RasterCutter/issues
 repository=https://github.com/a-maurin/RasterCutter
 hasProcessingProvider=no
