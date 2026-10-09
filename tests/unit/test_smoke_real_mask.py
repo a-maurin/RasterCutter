@@ -23,14 +23,15 @@ from pochoir_raster.pochoir_raster_worker import (
 
 def test_smoke_with_real_pochoir(qgis_app):
     """Vérifie le découpage avec le vrai fichier pochoir_bva_fix.gpkg du projet."""
-    candidate_paths = [
-        Path(__file__).resolve().parent.parent.parent / "donnees" / "vecteurs" / "pochoir_bva_fix.gpkg",
-        Path(__file__).resolve().parents[3] / "donnees" / "vecteurs" / "pochoir_bva_fix.gpkg",
-        Path(__file__).resolve().parents[4] / "donnees" / "vecteurs" / "pochoir_bva_fix.gpkg",
+    workspace_dir = Path(__file__).resolve().parent.parent.parent
+    candidates = [
+        workspace_dir / "donnees" / "vecteurs" / "pochoir_bva_fix.gpkg",
+        workspace_dir.parent.parent / "pariries_permanentes" / "projet_sig" / "pochoir_bva_fix.gpkg",
+        workspace_dir.parent / "pochoir_bva_fix.gpkg",
     ]
-    pochoir_path = next((p for p in candidate_paths if p.exists()), None)
+    pochoir_path = next((p for p in candidates if p.exists()), None)
     if not pochoir_path:
-        pytest.skip("Test smoke local : pochoir_bva_fix.gpkg absent de l'environnement.")
+        pytest.skip("pochoir_bva_fix.gpkg non trouvé dans l'environnement")
 
     vec_layer = QgsVectorLayer(str(pochoir_path), "pochoir_reel", "ogr")
     assert vec_layer.isValid()

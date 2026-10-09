@@ -12,6 +12,8 @@ from pochoir_raster.pochoir_raster_worker import (
     generate_tab_file,
     generate_j2w_file,
     convert_geotiff_to_jp2,
+    generate_grid_tiles,
+    get_departments_intersecting_geometry,
 )
 
 
@@ -177,3 +179,34 @@ def test_task_cancellation_during_run(tmp_path, qgis_app):
     tile = {"name": "test.jp2", "bbox": (0, 0, 1000, 1000)}
     res = extract_grid_tile_jp2(mock_layer, tile, str(tmp_path / "test.jp2"), task=mock_task)
     assert res is None
+
+
+def test_generate_grid_tiles_multi_departments(qgis_app):
+    """Vérifie le découpage et le nommage dynamique {DEP} sur plusieurs départements."""
+    from qgis.core import QgsGeometry, QgsRectangle
+
+    # Emprise à cheval sur la Côte-d'Or (21) et l'Yonne (89)
+    # X de 785 km à 815 km, Y de 6720 km à 6750 km
+    rect = QgsRectangle(785000.0, 6720000.0, 815000.0, 6750000.0)
+    geom = QgsGeometry.fromRect(rect)
+
+    # 1. Test avec {DEP}-2023
+    tiles = generate_grid_tiles(geom, tile_size_m=5000, prefix="{DEP}-2023")
+    assert len(tiles) > 0
+
+    dept_prefixes = set()
+    for t in tiles:
+        # Extraire le préfixe XX-2023
+        name = t["name"]
+        prefix_part = name.split("-")[0]
+        dept_prefixes.add(prefix_part)
+
+    # Doit contenir au moins 21 et 89
+    assert "21" in dept_prefixes
+    assert "89" in dept_prefixes
+
+    # 2. Test avec préfixe fixe sans {DEP} (ex: 21-2024) : toutes les dalles restent en 21
+    tiles_fixed = generate_grid_tiles(geom, tile_size_m=5000, prefix="21-2024")
+    for t in tiles_fixed:
+        assert t["name"].startswith("21-2024-")
+

@@ -438,10 +438,153 @@ def estimate_grid_tiles_count(vector_layer, tile_size_m=5000, apply_filter=True,
     return count
 
 
+_CACHED_DEPARTMENTS = None
+
+
+def get_departments_data():
+    """
+    Charge les géométries et codes des départements en Lambert-93 (EPSG:2154).
+    Recherche en priorité dans le projet actif (couche 'dep_smbva' ou avec champ INSEE_DEP),
+    puis dans les fichiers GPKG disponibles (embarqué ou local).
+    """
+    global _CACHED_DEPARTMENTS
+    if _CACHED_DEPARTMENTS is not None:
+        return _CACHED_DEPARTMENTS
+
+    results = []
+    target_crs = QgsCoordinateReferenceSystem("EPSG:2154")
+    layer = None
+
+    project = QgsProject.instance()
+    if project:
+        for lyr in project.mapLayers().values():
+            if isinstance(lyr, QgsVectorLayer) and lyr.isValid():
+                if "dep" in lyr.name().lower() or (lyr.fields() and lyr.fields().indexFromName("INSEE_DEP") != -1):
+                    layer = lyr
+                    break
+
+    if not layer:
+        base_dir = os.path.dirname(__file__)
+        candidates = [
+            os.path.join(base_dir, "data", "dep_smbva.gpkg"),
+            os.path.abspath(os.path.join(base_dir, "..", "..", "..", "dep_smbva.gpkg")),
+            os.path.abspath(os.path.join(base_dir, "..", "..", "..", "..", "dep_smbva.gpkg")),
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                layer = QgsVectorLayer(f"{c}|layername=dep_smbva", "dep_smbva", "ogr")
+                if layer.isValid():
+                    break
+
+    if layer and layer.isValid():
+        src_crs = layer.crs()
+        transform = None
+        if src_crs.isValid() and src_crs != target_crs:
+            transform = QgsCoordinateTransform(src_crs, target_crs, QgsCoordinateTransformContext())
+
+        fields = layer.fields()
+        code_field = "INSEE_DEP" if fields.indexFromName("INSEE_DEP") != -1 else None
+        if not code_field:
+            for f in fields:
+                if "dep" in f.name().lower() or "code" in f.name().lower():
+                    code_field = f.name()
+                    break
+
+        for feat in layer.getFeatures():
+            code = str(feat[code_field]).strip() if code_field and feat[code_field] is not None else ""
+            if not code:
+                continue
+            geom = QgsGeometry(feat.geometry())
+            if transform and not geom.isEmpty():
+                geom.transform(transform)
+            if not geom.isGeosValid():
+                v = geom.makeValid()
+                if v and not v.isEmpty():
+                    geom = v
+            clean_code = code.lstrip("0") or code
+            results.append({
+                "code": clean_code,
+                "name": str(feat["NOM_DEP"]) if fields.indexFromName("NOM_DEP") != -1 else "",
+                "geometry": geom,
+            })
+
+    _CACHED_DEPARTMENTS = results
+    return _CACHED_DEPARTMENTS
+
+
+def get_departments_intersecting_geometry(geom_2154):
+    """Retourne la liste triée des codes de départements intersectant une géométrie Lambert-93."""
+    if not geom_2154 or geom_2154.isEmpty():
+        return []
+    dept_data = get_departments_data()
+    intersected = set()
+    for d in dept_data:
+        if d["geometry"].intersects(geom_2154):
+            intersected.add(d["code"])
+    return sorted(list(intersected), key=lambda x: int(x) if x.isdigit() else x)
+
+
+def query_ign_vintage_and_department(raster_layer, point_2154=None):
+    """
+    Interroge les attributs d'un flux WMS/WMTS IGN Géoplateforme à une coordonnée donnée.
+    Retourne (dep, year) si trouvé, sinon (None, None).
+    """
+    if not raster_layer or not raster_layer.isValid():
+        return None, None
+
+    dp = raster_layer.dataProvider()
+    if not dp:
+        return None, None
+
+    provider = raster_layer.providerType().lower()
+    if provider not in ["wms", "wmts"]:
+        return None, None
+
+    target_crs = raster_layer.crs()
+    if point_2154:
+        crs_2154 = QgsCoordinateReferenceSystem("EPSG:2154")
+        if target_crs.isValid() and target_crs != crs_2154:
+            transform = QgsCoordinateTransform(crs_2154, target_crs, QgsCoordinateTransformContext())
+            pt_query = transform.transform(point_2154)
+        else:
+            pt_query = point_2154
+    else:
+        extent = raster_layer.extent()
+        pt_query = extent.center()
+
+    try:
+        from qgis.core import QgsRaster
+        res = dp.identify(pt_query, QgsRaster.IdentifyFormatFeature)
+        if res and res.isValid():
+            for k, store_list in res.results().items():
+                for store in store_list:
+                    for feat in store.features():
+                        fields = feat.fields()
+                        dep = None
+                        year = None
+                        if fields:
+                            if fields.indexFromName("dep") != -1 and feat["dep"]:
+                                dep = str(feat["dep"]).strip()
+                            if fields.indexFromName("pva") != -1 and feat["pva"]:
+                                year = str(feat["pva"]).strip()
+                            elif fields.indexFromName("date_vol") != -1 and feat["date_vol"]:
+                                m = re.search(r"\b(199\d|20[0-3]\d)\b", str(feat["date_vol"]))
+                                if m:
+                                    year = m.group(1)
+                        if dep or year:
+                            clean_dep = dep.lstrip("0") if dep else None
+                            return clean_dep, year
+    except Exception:
+        pass
+
+    return None, None
+
+
 def generate_grid_tiles(pochoir_geom, tile_size_m=5000, prefix="21-2024", pochoir_crs=None):
     """
     Découpe l'emprise du pochoir en mailles carrées calées sur les coordonnées rondes Lambert-93 (EPSG:2154).
     Retourne la liste des dalles intersectant le pochoir avec leurs coordonnées et nommage officiel IGN.
+    Supporte le préfixe dynamique multi-départements si '{DEP}' ou 'Auto-' est présent.
     """
     if not pochoir_geom or pochoir_geom.isEmpty():
         return []
@@ -466,8 +609,11 @@ def generate_grid_tiles(pochoir_geom, tile_size_m=5000, prefix="21-2024", pochoi
     x_max = math.ceil(bbox.xMaximum() / tile_size_m) * tile_size_m
     y_max = math.ceil(bbox.yMaximum() / tile_size_m) * tile_size_m
 
-    tiles = []
     clean_prefix = (prefix or "21-2024").strip()
+    has_dynamic_dep = "{dep}" in clean_prefix.lower() or clean_prefix.upper().startswith("AUTO-")
+    dept_data = get_departments_data() if has_dynamic_dep else []
+
+    tiles = []
     x = x_min
     while x < x_max:
         y = y_min
@@ -475,9 +621,34 @@ def generate_grid_tiles(pochoir_geom, tile_size_m=5000, prefix="21-2024", pochoi
             cell_rect = QgsRectangle(x, y, x + tile_size_m, y + tile_size_m)
             cell_geom = QgsGeometry.fromRect(cell_rect)
             if cell_geom.intersects(geom_2154):
+                if has_dynamic_dep:
+                    tile_dep = "21"
+                    pt_center = cell_geom.centroid()
+                    found = False
+                    for d in dept_data:
+                        if d["geometry"].contains(pt_center):
+                            tile_dep = d["code"]
+                            found = True
+                            break
+                    if not found:
+                        max_area = 0.0
+                        for d in dept_data:
+                            inter = cell_geom.intersection(d["geometry"])
+                            if not inter.isEmpty() and inter.area() > max_area:
+                                max_area = inter.area()
+                                tile_dep = d["code"]
+
+                    if "{dep}" in clean_prefix.lower():
+                        tile_prefix = re.sub(r"\{dep\}", tile_dep, clean_prefix, flags=re.IGNORECASE)
+                    else:
+                        year_part = clean_prefix[5:] if len(clean_prefix) > 5 else "2024"
+                        tile_prefix = f"{tile_dep}-{year_part}"
+                else:
+                    tile_prefix = clean_prefix
+
                 x_km = int(x // 1000)
                 y_top_km = int((y + tile_size_m) // 1000)
-                tile_base_name = f"{clean_prefix}-{x_km:04d}-{y_top_km:04d}-LA93"
+                tile_base_name = f"{tile_prefix}-{x_km:04d}-{y_top_km:04d}-LA93"
                 tiles.append({
                     "name": f"{tile_base_name}.jp2",
                     "base_name": tile_base_name,
@@ -578,7 +749,7 @@ def extract_grid_tile_jp2(
                 return None
             raise RuntimeError(f"Échec de l'extraction de la dalle {tile_dict['name']}")
 
-        convert_geotiff_to_jp2(tmp_tif, dst_jp2, target_epsg=2154)
+        convert_geotiff_to_jp2(tmp_tif, dst_jp2, target_epsg=2154, target_bounds=tile_dict.get("bbox"))
         return dst_jp2
 
     finally:
@@ -656,7 +827,7 @@ def generate_j2w_file(jp2_path: str, bbox: tuple, width: int, height: int):
         f.writelines(lines)
 
 
-def convert_geotiff_to_jp2(src_tif: str, dst_jp2: str, target_epsg: int = 2154):
+def convert_geotiff_to_jp2(src_tif: str, dst_jp2: str, target_epsg: int = 2154, target_bounds: tuple = None):
     """Convertit un GeoTIFF en JPEG 2000 (.jp2) avec pilote JP2OpenJPEG et calages associés."""
     from osgeo import gdal
     gdal.UseExceptions()
@@ -675,9 +846,14 @@ def convert_geotiff_to_jp2(src_tif: str, dst_jp2: str, target_epsg: int = 2154):
 
     tmp_reprojected = None
     trans_src = src_tif
-    if needs_reproject:
+    if needs_reproject or target_bounds:
         tmp_reprojected = src_tif.replace(".tif", "_reproj.tif")
-        warp_ds = gdal.Warp(tmp_reprojected, src_tif, dstSRS=f"EPSG:{target_epsg}")
+        warp_opts = gdal.WarpOptions(
+            dstSRS=f"EPSG:{target_epsg}",
+            outputBounds=list(target_bounds) if target_bounds else None,
+            resampleAlg=gdal.GRA_Bilinear,
+        )
+        warp_ds = gdal.Warp(tmp_reprojected, src_tif, options=warp_opts)
         warp_ds = None
         trans_src = tmp_reprojected
 
@@ -1069,9 +1245,278 @@ class PochoirRasterTask(QgsTask):
                 self.on_finished(False, msg, None)
 
 
+class LayerTaskAdapter:
+    """Adaptateur relayant la progression d'une couche individuelle vers la tâche multi-couches globale."""
+
+    def __init__(self, parent_task, idx: int, total: int, layer_name: str):
+        self.parent_task = parent_task
+        self.idx = idx
+        self.total = max(total, 1)
+        self.layer_name = layer_name
+
+    def update_progress(self, pct: float, message: str = None):
+        base_pct = (self.idx / self.total) * 100.0
+        layer_scale = 100.0 / self.total
+        mapped = min(100.0, base_pct + (float(pct) / 100.0) * layer_scale)
+        prefix = f"[{self.idx + 1}/{self.total}] {self.layer_name}"
+        msg = f"{prefix} — {message}" if message else prefix
+        self.parent_task.update_progress(mapped, msg)
+
+    def isCanceled(self) -> bool:
+        return self.parent_task.isCanceled()
+
+    def progress(self) -> float:
+        return self.parent_task.progress()
+
+
+class PochoirMultiRasterTask(QgsTask):
+    """Tâche d'arrière-plan QgsTask pour le traitement par lot séquentiel de plusieurs couches rasters."""
+    step_progress = pyqtSignal(float, str)
+
+    def __init__(self, config, iface=None, on_progress=None, on_finished=None):
+        super().__init__("Découpage multi-couches RasterCutter", QgsTask.CanCancel)
+        self.config = config
+        self.iface = iface
+        self.on_progress = on_progress
+        self.on_finished = on_finished
+        self.current_message = "Initialisation du traitement par lot..."
+
+        self.raster_layers = config.get("raster_layers", [])
+        self.pochoir_layer = config["pochoir_layer"]
+        self.dest_root = config.get("output_path", "")
+        self.is_mbtiles = config.get("is_mbtiles", False)
+        self.is_jp2 = config.get("is_jp2", False)
+        self.apply_filter = config.get("apply_filter", True)
+        self.selected_only = config.get("selected_only", False)
+        self.white_background = config.get("white_background", False)
+        self.autocad_tfw = config.get("autocad_tfw", True)
+        self.zoom_min = config.get("zoom_min", 10)
+        self.zoom_max = config.get("zoom_max", 18)
+        self.tile_size = config.get("tile_size", 5000)
+        self.tile_prefix = config.get("tile_prefix", "21-2024")
+        self.skip_existing = config.get("skip_existing", True)
+
+        self.temp_dir = None
+        self.error_message = None
+        self.success = False
+        self.produced_outputs = []
+
+    def update_progress(self, pct: float, message: str = None):
+        """Met à jour le pourcentage d'avancement et diffuse l'état textuel."""
+        if message:
+            self.current_message = message
+        self.setProgress(pct)
+        try:
+            self.step_progress.emit(pct, self.current_message)
+        except Exception:
+            pass
+
+    def run(self):
+        """Exécution sur le thread de travail en arrière-plan."""
+        try:
+            total_layers = len(self.raster_layers)
+            if total_layers == 0:
+                raise RuntimeError("Aucune couche raster sélectionnée pour le découpage.")
+
+            self.update_progress(2, "Création du dossier de destination...")
+            os.makedirs(self.dest_root, exist_ok=True)
+            self.temp_dir = tempfile.mkdtemp(prefix="pochoir_multi_")
+
+            for idx, rlayer in enumerate(self.raster_layers):
+                if self.isCanceled():
+                    return False
+
+                layer_name = rlayer.name()
+                clean_name = re.sub(r'[\\/*?:"<>|]', "_", layer_name).strip() or f"couche_{idx+1}"
+                clean_name = re.sub(r"\s+", "_", clean_name)
+
+                # Création du sous-dossier dédié par couche
+                subfolder = os.path.join(self.dest_root, clean_name)
+                os.makedirs(subfolder, exist_ok=True)
+
+                adapter = LayerTaskAdapter(self, idx, total_layers, layer_name)
+                adapter.update_progress(5, "Analyse et préparation du pochoir...")
+
+                # Détection automatique de la meilleure résolution pour les flux distants
+                z_info = detect_raster_zoom_levels(rlayer)
+                layer_zoom_max = z_info.get("max_zoom", self.zoom_max)
+                layer_zoom_min = z_info.get("min_zoom", self.zoom_min)
+
+                # Préparation du pochoir vectoriel reprojeté dans le SCR du raster
+                mask_gpkg, extent, _ = prepare_mask_dataset(
+                    vector_layer=self.pochoir_layer,
+                    raster_crs=rlayer.crs(),
+                    apply_filter=self.apply_filter,
+                    selected_only=self.selected_only,
+                    output_dir=self.temp_dir,
+                )
+
+                if self.isCanceled():
+                    return False
+
+                provider_type = rlayer.providerType().lower()
+                is_remote = provider_type in ["wms", "wmts", "xyz", "wcs", "arcgismapserver", "arcgistileserver"]
+
+                if self.is_mbtiles:
+                    out_file = os.path.join(subfolder, f"{clean_name}.mbtiles")
+                    fb = TaskProcessingFeedback(
+                        adapter,
+                        start_pct=15.0,
+                        end_pct=95.0,
+                        step_prefix="Génération MBTiles",
+                    )
+                    generate_mbtiles_clip(
+                        raster_layer=rlayer,
+                        mask_path=mask_gpkg,
+                        extent=extent,
+                        zoom_min=layer_zoom_min,
+                        zoom_max=layer_zoom_max,
+                        output_path=out_file,
+                        white_background=self.white_background,
+                        feedback=fb,
+                    )
+                    self.produced_outputs.append({
+                        "name": layer_name,
+                        "path": out_file,
+                        "type": "mbtiles",
+                    })
+
+                elif self.is_jp2:
+                    adapter.update_progress(10, "Calcul du carroyage...")
+                    pochoir_geom, pochoir_crs = get_pochoir_geometry(
+                        self.pochoir_layer,
+                        apply_filter=self.apply_filter,
+                        selected_only=self.selected_only,
+                    )
+                    tiles = generate_grid_tiles(
+                        pochoir_geom=pochoir_geom,
+                        tile_size_m=self.tile_size,
+                        prefix=self.tile_prefix,
+                        pochoir_crs=pochoir_crs,
+                    )
+                    t_count = len(tiles)
+                    processed_tiles = []
+                    for t_idx, t in enumerate(tiles):
+                        if self.isCanceled():
+                            return False
+
+                        dst_jp2 = os.path.join(subfolder, t["name"])
+                        t_start = 10.0 + (t_idx / max(t_count, 1)) * 80.0
+                        adapter.update_progress(t_start, f"Dalle {t_idx+1}/{t_count}")
+
+                        extract_grid_tile_jp2(
+                            raster_layer=rlayer,
+                            tile_dict=t,
+                            dst_jp2=dst_jp2,
+                            target_zoom=layer_zoom_max,
+                            task=adapter,
+                        )
+                        processed_tiles.append(t)
+
+                    if processed_tiles:
+                        try:
+                            from .dalles_filter import export_tableau_assemblage_dxf, export_tableau_assemblage_shp
+                        except ImportError:
+                            from dalles_filter import export_tableau_assemblage_dxf, export_tableau_assemblage_shp
+                        export_tableau_assemblage_dxf(processed_tiles, Path(subfolder) / "tableau_assemblage.dxf")
+                        export_tableau_assemblage_shp(processed_tiles, Path(subfolder) / "tableau_assemblage.shp", epsg=2154)
+
+                    self.produced_outputs.append({
+                        "name": layer_name,
+                        "path": subfolder,
+                        "type": "jp2",
+                    })
+
+                else:
+                    out_file = os.path.join(subfolder, f"{clean_name}.tif")
+                    if not is_remote and os.path.exists(rlayer.source()):
+                        fb = TaskProcessingFeedback(
+                            adapter,
+                            start_pct=15.0,
+                            end_pct=95.0,
+                            step_prefix="Découpe GDAL",
+                        )
+                        clip_local_raster_geotiff(
+                            raster_source=rlayer,
+                            mask_path=mask_gpkg,
+                            output_path=out_file,
+                            white_background=self.white_background,
+                            autocad_tfw=self.autocad_tfw,
+                            feedback=fb,
+                        )
+                    else:
+                        clip_remote_raster_geotiff(
+                            raster_layer=rlayer,
+                            mask_path=mask_gpkg,
+                            extent=extent,
+                            output_path=out_file,
+                            white_background=self.white_background,
+                            target_zoom=layer_zoom_max,
+                            task=adapter,
+                        )
+                    self.produced_outputs.append({
+                        "name": layer_name,
+                        "path": out_file,
+                        "type": "geotiff",
+                    })
+
+                adapter.update_progress(100, "Couche découpée avec succès.")
+
+            self.update_progress(100, f"Découpage terminé pour les {total_layers} couches.")
+            self.success = True
+            return True
+
+        except Exception as exc:
+            self.error_message = str(exc)
+            return False
+        finally:
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def finished(self, result):
+        """Exécuté sur le thread principal (UI) à la fin de la tâche pour charger le groupe QGIS."""
+        if result and self.success and not self.isCanceled():
+            pochoir_name = self.pochoir_layer.name() if hasattr(self.pochoir_layer, "name") else "Pochoir"
+            group_name = f"Découpe - {pochoir_name}"
+            project = QgsProject.instance()
+            root = project.layerTreeRoot()
+            group = root.addGroup(group_name)
+
+            for item in self.produced_outputs:
+                if item["type"] == "geotiff" and os.path.exists(item["path"]):
+                    layer = QgsRasterLayer(item["path"], f"{item['name']}_decoupe", "gdal")
+                    if layer and layer.isValid():
+                        project.addMapLayer(layer, False)
+                        group.addLayer(layer)
+                elif item["type"] == "mbtiles" and os.path.exists(item["path"]):
+                    layer = QgsRasterLayer(f"type=mbtiles&url={item['path']}", f"{item['name']}_decoupe", "wms")
+                    if layer and layer.isValid():
+                        project.addMapLayer(layer, False)
+                        group.addLayer(layer)
+                elif item["type"] == "jp2":
+                    shp_path = os.path.join(item["path"], "tableau_assemblage.shp")
+                    if os.path.exists(shp_path):
+                        layer = QgsVectorLayer(shp_path, f"Tableau d'assemblage ({item['name']})", "ogr")
+                        if layer and layer.isValid():
+                            project.addMapLayer(layer, False)
+                            group.addLayer(layer)
+
+            msg = f"Découpe terminée avec succès pour {len(self.produced_outputs)} couche(s).\nRésultats rangés dans le groupe '{group_name}'."
+            if self.on_finished:
+                self.on_finished(True, msg, None)
+        else:
+            msg = "Opération annulée par l'utilisateur." if self.isCanceled() else (self.error_message or "Erreur inconnue.")
+            if self.on_finished:
+                self.on_finished(False, msg, None)
+
+
 def launch_clipping_task(config, iface=None, on_progress=None, on_finished=None):
     """Instancie et enregistre la tâche dans le gestionnaire QGIS."""
-    task = PochoirRasterTask(config, iface=iface, on_progress=on_progress, on_finished=on_finished)
+    if config.get("is_multi_layers"):
+        task = PochoirMultiRasterTask(config, iface=iface, on_progress=on_progress, on_finished=on_finished)
+    else:
+        task = PochoirRasterTask(config, iface=iface, on_progress=on_progress, on_finished=on_finished)
+
     if on_progress:
         task.step_progress.connect(on_progress, Qt.QueuedConnection)
 
@@ -1081,3 +1526,4 @@ def launch_clipping_task(config, iface=None, on_progress=None, on_finished=None)
 
 
 PochoirRasterWorker = PochoirRasterTask
+

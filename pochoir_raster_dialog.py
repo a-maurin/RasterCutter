@@ -46,6 +46,8 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QMessageBox,
     QFrame,
+    QListWidget,
+    QListWidgetItem,
 )
 from qgis.core import (
     QgsProject,
@@ -54,6 +56,10 @@ from qgis.core import (
     QgsMapLayerProxyModel,
     QgsApplication,
     QgsSettings,
+    QgsGeometry,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsCoordinateTransformContext,
 )
 from qgis.gui import QgsMapLayerComboBox
 from .dalles_filter import filter_and_copy_tiles
@@ -64,6 +70,8 @@ from .pochoir_raster_worker import (
     get_pochoir_geometry,
     estimate_grid_tiles_count,
     PochoirRasterWorker,
+    get_departments_intersecting_geometry,
+    query_ign_vintage_and_department,
 )
 
 
@@ -199,7 +207,13 @@ class PochoirRasterDialog(QDialog):
         raster_layout = QVBoxLayout(raster_group)
         raster_layout.setSpacing(6)
 
-        raster_row = QHBoxLayout()
+        self.chk_multi_layers = QCheckBox("Traiter plusieurs couches rasters")
+        self.chk_multi_layers.setToolTip("Cocher plusieurs couches rasters du projet QGIS à découper avec le pochoir.")
+        raster_layout.addWidget(self.chk_multi_layers)
+
+        self.widget_single_raster = QWidget()
+        raster_row = QHBoxLayout(self.widget_single_raster)
+        raster_row.setContentsMargins(0, 0, 0, 0)
         self.combo_raster = QgsMapLayerComboBox()
         self.combo_raster.setFilters(QgsMapLayerProxyModel.RasterLayer)
         self.combo_raster.setAllowEmptyLayer(True)
@@ -209,7 +223,30 @@ class PochoirRasterDialog(QDialog):
         self.btn_browse_raster = QPushButton("Parcourir fichier...")
         self.btn_browse_raster.setToolTip("Sélectionner un fichier raster local")
         raster_row.addWidget(self.btn_browse_raster)
-        raster_layout.addLayout(raster_row)
+        raster_layout.addWidget(self.widget_single_raster)
+
+        # Panneau multi-couches (affiché lorsque chk_multi_layers est coché)
+        self.frame_multi_layers = QFrame()
+        multi_layout = QVBoxLayout(self.frame_multi_layers)
+        multi_layout.setContentsMargins(0, 4, 0, 4)
+        multi_layout.setSpacing(4)
+
+        self.list_layers = QListWidget()
+        self.list_layers.setMaximumHeight(140)
+        multi_layout.addWidget(self.list_layers)
+
+        multi_btn_row = QHBoxLayout()
+        self.btn_select_all = QPushButton("Tout cocher")
+        self.btn_deselect_all = QPushButton("Tout décocher")
+        self.btn_refresh_layers = QPushButton("Actualiser")
+        multi_btn_row.addWidget(self.btn_select_all)
+        multi_btn_row.addWidget(self.btn_deselect_all)
+        multi_btn_row.addStretch()
+        multi_btn_row.addWidget(self.btn_refresh_layers)
+        multi_layout.addLayout(multi_btn_row)
+
+        self.frame_multi_layers.hide()
+        raster_layout.addWidget(self.frame_multi_layers)
 
         # Panneau options de zoom (affiché pour flux distants WMS/WMTS/XYZ ou export MBTiles)
         self.frame_zoom = QFrame()
@@ -334,9 +371,10 @@ class PochoirRasterDialog(QDialog):
         row_grid.addWidget(self.combo_grid_size, 1)
 
         row_grid.addWidget(QLabel("Préfixe des dalles :"))
-        self.txt_tile_prefix = QLineEdit("21-2024")
-        self.txt_tile_prefix.setMaximumWidth(120)
-        self.txt_tile_prefix.setToolTip("Préfixe appliqué aux noms de dalles (ex : 21-2024)")
+        self.txt_tile_prefix = QLineEdit("")
+        self.txt_tile_prefix.setPlaceholderText("Auto ({DEP}-AAAA) ou personnalisé")
+        self.txt_tile_prefix.setMaximumWidth(220)
+        self.txt_tile_prefix.setToolTip("Préfixe appliqué aux noms de dalles (laisser vide pour calcul automatique)")
         row_grid.addWidget(self.txt_tile_prefix)
         jp2_opts_layout.addLayout(row_grid)
 
@@ -565,6 +603,11 @@ class PochoirRasterDialog(QDialog):
         self.spin_zoom_min.valueChanged.connect(self._on_zoom_min_changed)
         self.spin_zoom_max.valueChanged.connect(self._on_zoom_max_changed)
 
+        self.chk_multi_layers.toggled.connect(self._on_multi_layers_toggled)
+        self.btn_select_all.clicked.connect(self._select_all_layers)
+        self.btn_deselect_all.clicked.connect(self._deselect_all_layers)
+        self.btn_refresh_layers.clicked.connect(self._populate_multi_layers_list)
+
         self.btn_run.clicked.connect(self.run_clipping)
         self.btn_cancel.clicked.connect(self._on_btn_cancel_clicked)
 
@@ -637,7 +680,68 @@ class PochoirRasterDialog(QDialog):
             if current_txt:
                 self.txt_output_file.setText(str(Path(current_txt).with_suffix(".tif")))
 
+        if hasattr(self, "chk_multi_layers") and self.chk_multi_layers.isChecked():
+            self.radio_temp.setEnabled(False)
+            self.radio_file.setChecked(True)
+            self.radio_file.setText("Enregistrer dans un dossier")
+            self.txt_output_file.setPlaceholderText("Dossier de destination des couches...")
+            self.btn_browse_output.setText("Parcourir dossier...")
+
         self._update_zoom_panel_visibility()
+
+    def _populate_multi_layers_list(self):
+        """Remplit la liste des couches rasters issues du projet QGIS actif."""
+        self.list_layers.clear()
+        project = QgsProject.instance()
+        for layer in project.mapLayers().values():
+            if isinstance(layer, QgsRasterLayer) and layer.isValid():
+                item = QListWidgetItem(layer.name())
+                item.setData(Qt.UserRole, layer.id())
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                self.list_layers.addItem(item)
+
+    def _select_all_layers(self):
+        """Coche l'ensemble des couches de la liste multi-couches."""
+        for i in range(self.list_layers.count()):
+            self.list_layers.item(i).setCheckState(Qt.Checked)
+
+    def _deselect_all_layers(self):
+        """Décoche l'ensemble des couches de la liste multi-couches."""
+        for i in range(self.list_layers.count()):
+            self.list_layers.item(i).setCheckState(Qt.Unchecked)
+
+    def _on_multi_layers_toggled(self, checked):
+        """Active ou désactive l'interface et le mode multi-couches."""
+        self.widget_single_raster.setVisible(not checked)
+        self.frame_multi_layers.setVisible(checked)
+        if checked:
+            if self.list_layers.count() == 0:
+                self._populate_multi_layers_list()
+            self.radio_temp.setEnabled(False)
+            self.radio_file.setChecked(True)
+            self.radio_file.setText("Enregistrer dans un dossier")
+            self.btn_browse_output.setText("Parcourir dossier...")
+            self.txt_output_file.setPlaceholderText("Dossier de destination des couches...")
+        else:
+            self._on_format_changed()
+
+    def get_selected_raster_layers(self):
+        """Retourne la liste des couches rasters sélectionnées."""
+        if hasattr(self, "chk_multi_layers") and self.chk_multi_layers.isChecked():
+            project = QgsProject.instance()
+            layers = []
+            for i in range(self.list_layers.count()):
+                item = self.list_layers.item(i)
+                if item.checkState() == Qt.Checked:
+                    layer_id = item.data(Qt.UserRole)
+                    layer = project.mapLayer(layer_id)
+                    if layer and isinstance(layer, QgsRasterLayer) and layer.isValid():
+                        layers.append(layer)
+            return layers
+        else:
+            layer = self.combo_raster.currentLayer()
+            return [layer] if layer and layer.isValid() else []
 
     def _update_tile_estimate(self):
         """Calcule dynamiquement le nombre de dalles estimé pour la grille JP2."""
@@ -739,25 +843,109 @@ class PochoirRasterDialog(QDialog):
 
     def _on_raster_layer_changed(self, layer):
         self._update_zoom_panel_visibility(layer)
-        self._auto_detect_prefix_from_raster(layer)
+        self._update_auto_prefix(raster_layer=layer)
 
-    def _auto_detect_prefix_from_raster(self, layer):
-        """Met à jour le préfixe de nommage des dalles depuis les métadonnées et nom du raster."""
-        if not layer or not layer.isValid():
+    def _update_auto_prefix(self, raster_layer=None, pochoir_layer=None):
+        """Met à jour automatiquement le préfixe selon le raster et le pochoir (mono ou multi-départements)."""
+        r_layer = raster_layer or self.combo_raster.currentLayer()
+        p_layer = pochoir_layer or self.combo_pochoir.currentLayer()
+
+        current_text = self.txt_tile_prefix.text().strip()
+
+        # Protection des saisies personnalisées de l'utilisateur (hors format standard ou template)
+        is_standard = bool(re.match(r"^([0-9]{1,3}|2[ABab])-([0-9]{4})$", current_text))
+        is_template = bool(re.match(r"^\{dep\}-([0-9]{4})$", current_text, re.IGNORECASE))
+        is_auto = bool(re.match(r"^auto-([0-9]{4})$", current_text, re.IGNORECASE))
+
+        if current_text and not (is_standard or is_template or is_auto):
             return
-        name = layer.name() or ""
-        source = layer.source() or ""
-        metadata_text = ""
-        try:
-            meta = layer.metadata()
-            if meta:
-                metadata_text = f"{meta.abstract()} {meta.title()} {meta.identifier()}"
-        except Exception:
-            pass
 
-        current_prefix = self.txt_tile_prefix.text().strip()
-        new_prefix = extract_prefix_from_raster_source(name, f"{source} {metadata_text}", current_prefix)
-        if new_prefix and new_prefix != current_prefix:
+        has_raster = bool(r_layer and r_layer.isValid())
+        has_pochoir = bool(p_layer and p_layer.isValid())
+
+        # Si aucune couche n'est sélectionnée, réinitialiser à vide pour réafficher le filigrane
+        if not has_raster and not has_pochoir:
+            if not current_text or is_standard or is_template or is_auto:
+                self.txt_tile_prefix.setText("")
+                self.txt_tile_prefix.setToolTip("Préfixe appliqué aux noms de dalles (laisser vide pour calcul automatique)")
+            return
+
+        year = "2024"
+        dep = "21"
+        if is_standard:
+            m = re.match(r"^([0-9]{1,3}|2[ABab])-([0-9]{4})$", current_text)
+            dep, year = m.group(1), m.group(2)
+        elif is_template or is_auto:
+            m = re.search(r"([0-9]{4})", current_text)
+            if m:
+                year = m.group(1)
+
+        # 1. Détection géométrique du pochoir & centre
+        pochoir_geom = None
+        center_pt = None
+        if p_layer and p_layer.isValid():
+            try:
+                geom_res, geom_crs = get_pochoir_geometry(
+                    p_layer,
+                    apply_filter=self.chk_filter.isChecked(),
+                    selected_only=self.chk_selected_only.isChecked(),
+                )
+                if geom_res and not geom_res.isEmpty():
+                    target_crs = QgsCoordinateReferenceSystem("EPSG:2154")
+                    if geom_crs and geom_crs.isValid() and geom_crs != target_crs:
+                        trans = QgsCoordinateTransform(geom_crs, target_crs, QgsCoordinateTransformContext())
+                        pochoir_geom = QgsGeometry(geom_res)
+                        pochoir_geom.transform(trans)
+                    else:
+                        pochoir_geom = geom_res
+                    center_pt = pochoir_geom.centroid().asPoint()
+            except Exception:
+                pass
+
+        # 2. Détection du millésime et département depuis le raster
+        if r_layer and r_layer.isValid():
+            provider = r_layer.providerType().lower()
+            if provider in ["wms", "wmts"]:
+                # Interrogation dynamique IGN Géoplateforme (GetFeatureInfo)
+                ign_dep, ign_year = query_ign_vintage_and_department(r_layer, center_pt)
+                if ign_year:
+                    year = ign_year
+                if ign_dep:
+                    dep = ign_dep
+            else:
+                # Fichier local : métadonnées et nom de fichier
+                loc_pref = extract_prefix_from_raster_source(
+                    r_layer.name(),
+                    r_layer.source(),
+                    f"{dep}-{year}",
+                )
+                m_loc = re.match(r"^([0-9]{1,3}|2[ABab])-([0-9]{4})$", loc_pref)
+                if m_loc:
+                    dep, year = m_loc.group(1), m_loc.group(2)
+
+        # 3. Analyse spatiale des départements sous le pochoir
+        dept_codes = []
+        if pochoir_geom and not pochoir_geom.isEmpty():
+            try:
+                dept_codes = get_departments_intersecting_geometry(pochoir_geom)
+            except Exception:
+                pass
+
+        # 4. Règle de nommage multi ou mono-départements
+        if len(dept_codes) > 1:
+            new_prefix = f"{{DEP}}-{year}"
+            dept_list_str = ", ".join(dept_codes)
+            self.txt_tile_prefix.setToolTip(
+                f"Multi-départements ({dept_list_str}) : chaque dalle sera préfixée par son département réel."
+            )
+        elif len(dept_codes) == 1:
+            new_prefix = f"{dept_codes[0]}-{year}"
+            self.txt_tile_prefix.setToolTip(f"Département détecté sous le pochoir : {dept_codes[0]}")
+        else:
+            new_prefix = f"{dep}-{year}"
+            self.txt_tile_prefix.setToolTip(f"Préfixe des dalles : {new_prefix}")
+
+        if new_prefix != current_text:
             self.txt_tile_prefix.setText(new_prefix)
 
     def _on_pochoir_layer_changed(self, layer):
@@ -765,6 +953,8 @@ class PochoirRasterDialog(QDialog):
             self.lbl_pochoir_info.setText("Aucune couche pochoir valide sélectionnée.")
             self.chk_selected_only.setEnabled(False)
             self.chk_selected_only.setChecked(False)
+            self._update_tile_estimate()
+            self._update_auto_prefix(pochoir_layer=layer)
             return
 
         info_parts = [f"Type : {layer.geometryType()}"]
@@ -788,6 +978,7 @@ class PochoirRasterDialog(QDialog):
 
         self.lbl_pochoir_info.setText(" | ".join(info_parts))
         self._update_tile_estimate()
+        self._update_auto_prefix(pochoir_layer=layer)
 
         try:
             layer.selectionChanged.disconnect(self._on_selection_changed)
@@ -841,6 +1032,16 @@ class PochoirRasterDialog(QDialog):
                 QMessageBox.warning(self, "Erreur", f"Impossible d'ouvrir la couche pochoir :\n{file_path}")
 
     def _on_browse_output(self):
+        if hasattr(self, "chk_multi_layers") and self.chk_multi_layers.isChecked():
+            folder_path = QFileDialog.getExistingDirectory(
+                self,
+                "Sélectionner le dossier de destination des couches rasters",
+                self.txt_output_file.text() or "",
+            )
+            if folder_path:
+                self.txt_output_file.setText(folder_path)
+            return
+
         if self.radio_jp2.isChecked():
             folder_path = QFileDialog.getExistingDirectory(
                 self,
@@ -871,9 +1072,17 @@ class PochoirRasterDialog(QDialog):
 
     def get_configuration(self):
         """Récupère et valide l'ensemble des paramètres de l'onglet de découpe."""
-        raster_layer = self.combo_raster.currentLayer()
-        if not raster_layer or not raster_layer.isValid():
-            raise ValueError("Veuillez sélectionner une couche raster valide.")
+        is_multi = hasattr(self, "chk_multi_layers") and self.chk_multi_layers.isChecked()
+        raster_layers = self.get_selected_raster_layers()
+
+        if is_multi:
+            if not raster_layers:
+                raise ValueError("Veuillez cocher au moins une couche raster à découper.")
+            raster_layer = raster_layers[0]
+        else:
+            raster_layer = self.combo_raster.currentLayer()
+            if not raster_layer or not raster_layer.isValid():
+                raise ValueError("Veuillez sélectionner une couche raster valide.")
 
         pochoir_layer = self.combo_pochoir.currentLayer()
         if not pochoir_layer or not pochoir_layer.isValid():
@@ -881,19 +1090,30 @@ class PochoirRasterDialog(QDialog):
 
         is_mbtiles = self.radio_mbtiles.isChecked()
         is_jp2 = self.radio_jp2.isChecked()
-        is_temp = self.radio_temp.isChecked() and not is_mbtiles
+        is_temp = self.radio_temp.isChecked() and not is_mbtiles and not is_multi
         output_file = self.txt_output_file.text().strip() if not is_temp else ""
 
         if not is_temp and not output_file:
-            msg = "Veuillez spécifier le dossier de destination des dalles ou choisir 'Dossier temporaire'." if is_jp2 else "Veuillez spécifier le fichier de destination ou choisir 'Couche temporaire'."
+            if is_multi:
+                msg = "Veuillez spécifier le dossier de destination pour les couches découpées."
+            elif is_jp2:
+                msg = "Veuillez spécifier le dossier de destination des dalles ou choisir 'Dossier temporaire'."
+            else:
+                msg = "Veuillez spécifier le fichier de destination ou choisir 'Couche temporaire'."
             raise ValueError(msg)
 
         tile_size = self.combo_grid_size.currentData() if is_jp2 else 5000
-        tile_prefix = self.txt_tile_prefix.text().strip() if is_jp2 else "21-2024"
+        if is_jp2:
+            raw_prefix = self.txt_tile_prefix.text().strip()
+            tile_prefix = raw_prefix if raw_prefix else "{DEP}-2024"
+        else:
+            tile_prefix = "21-2024"
         skip_existing = self.chk_skip_existing.isChecked() if is_jp2 else True
 
         return {
             "raster_layer": raster_layer,
+            "raster_layers": raster_layers,
+            "is_multi_layers": is_multi,
             "pochoir_layer": pochoir_layer,
             "is_mbtiles": is_mbtiles,
             "is_jp2": is_jp2,
@@ -968,7 +1188,7 @@ class PochoirRasterDialog(QDialog):
                     )
                     if reply != QMessageBox.Yes:
                         return
-        elif not config.get("is_mbtiles") and config.get("raster_layer"):
+        elif not config.get("is_mbtiles") and not config.get("is_multi_layers") and config.get("raster_layer"):
             rlayer = config["raster_layer"]
             player = config["pochoir_layer"]
             extent = player.extent()
@@ -991,7 +1211,11 @@ class PochoirRasterDialog(QDialog):
         self.btn_cancel.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_bar.show()
-        self.lbl_status.setText("Découpage en cours...")
+        if config.get("is_multi_layers"):
+            count_layers = len(config.get("raster_layers", []))
+            self.lbl_status.setText(f"Découpage de {count_layers} couche(s) en cours...")
+        else:
+            self.lbl_status.setText("Découpage en cours...")
         self.lbl_status.setStyleSheet("color: #0f766e; font-weight: bold;")
 
         self.current_worker = launch_clipping_task(

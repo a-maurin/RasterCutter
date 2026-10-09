@@ -24,6 +24,7 @@ cp "${SCRIPT_DIR}/pochoir_raster_plugin.py" "${TEMP_DIR}/${PLUGIN_ID}/"
 cp "${SCRIPT_DIR}/pochoir_raster_dialog.py" "${TEMP_DIR}/${PLUGIN_ID}/"
 cp "${SCRIPT_DIR}/pochoir_raster_worker.py" "${TEMP_DIR}/${PLUGIN_ID}/"
 cp "${SCRIPT_DIR}/dalles_filter.py" "${TEMP_DIR}/${PLUGIN_ID}/"
+cp -r "${SCRIPT_DIR}/data" "${TEMP_DIR}/${PLUGIN_ID}/"
 
 # Nettoyage des résidus éventuels
 find "${TEMP_DIR}/${PLUGIN_ID}" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

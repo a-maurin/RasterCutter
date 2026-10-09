@@ -22,6 +22,7 @@ from pochoir_raster.pochoir_raster_worker import (
     prepare_mask_dataset,
     clip_local_raster_geotiff,
     PochoirRasterTask,
+    PochoirMultiRasterTask,
 )
 
 
@@ -207,4 +208,73 @@ def test_progress_feedback_continuous(sample_dataset):
     fb_raster.setProgress(100.0)
     assert abs(mock._prog - 75.0) < 1e-4
     assert "100%" in mock.history[-1][1]
+
+
+def test_multi_raster_task_execution(sample_dataset):
+    """Vérifie l'exécution séquentielle, les sous-dossiers et le groupe QGIS en multi-couches."""
+    raster_layer_1 = sample_dataset["raster_layer"]
+    vector_layer = sample_dataset["vector_layer"]
+    tmp_dir = os.path.dirname(raster_layer_1.source())
+
+    # Création d'une seconde couche raster synthétique
+    raster_path_2 = os.path.join(tmp_dir, "test_input_2.tif")
+    driver = gdal.GetDriverByName("GTiff")
+    ds = driver.Create(raster_path_2, 60, 60, 3, gdal.GDT_Byte)
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(3857)
+    ds.SetProjection(srs.ExportToWkt())
+    ds.SetGeoTransform([0, 10, 0, 600, 0, -10])
+    for b in range(1, 4):
+        ds.GetRasterBand(b).Fill(50 * b)
+    ds = None
+    raster_layer_2 = QgsRasterLayer(raster_path_2, "Raster Input 2", "gdal")
+    assert raster_layer_2.isValid()
+
+    out_dest_dir = os.path.join(tmp_dir, "multi_output")
+
+    config = {
+        "is_multi_layers": True,
+        "raster_layers": [raster_layer_1, raster_layer_2],
+        "pochoir_layer": vector_layer,
+        "is_mbtiles": False,
+        "is_jp2": False,
+        "is_temp": False,
+        "output_path": out_dest_dir,
+        "apply_filter": False,
+        "selected_only": False,
+        "white_background": False,
+        "autocad_tfw": True,
+        "zoom_min": 10,
+        "zoom_max": 18,
+    }
+
+    finished_called = []
+
+    def on_finished(success, message, layer):
+        finished_called.append((success, message))
+
+    task = PochoirMultiRasterTask(config, iface=None, on_finished=on_finished)
+    success = task.run()
+    assert success is True
+
+    # Vérification des sous-dossiers et fichiers créés
+    subfolder_1 = os.path.join(out_dest_dir, "Raster_Input")
+    subfolder_2 = os.path.join(out_dest_dir, "Raster_Input_2")
+    assert os.path.isdir(subfolder_1)
+    assert os.path.isdir(subfolder_2)
+    assert os.path.exists(os.path.join(subfolder_1, "Raster_Input.tif"))
+    assert os.path.exists(os.path.join(subfolder_2, "Raster_Input_2.tif"))
+
+    # Vérification du chargement groupé dans QGIS
+    task.finished(True)
+    assert len(finished_called) == 1
+    assert finished_called[0][0] is True
+    assert "2 couche(s)" in finished_called[0][1]
+
+    root = QgsProject.instance().layerTreeRoot()
+    group = root.findGroup(f"Découpe - {vector_layer.name()}")
+    assert group is not None
+    assert len(group.findLayers()) == 2
+    QgsProject.instance().clear()
+
 
